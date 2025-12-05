@@ -1,0 +1,12 @@
+requests
+pydantic
+colorama
+ollama
+chromadb
+sentence-transformers
+
+langgraph
+langchain
+langchain-openai
+numpy
+python-dotenv
