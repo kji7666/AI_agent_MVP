@@ -1,5 +1,5 @@
 from ollama import Client
-import config
+import src.config as config
 
 def sanitize_content(text: str) -> str:
     """

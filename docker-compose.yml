@@ -1,19 +1,19 @@
-version: '3.8'
-
 services:
-  coc-game:
-    build: .
-    # 載入環境變數 (.env)
-    env_file:
-      - .env
-    # 掛載目錄：讓你改了 Python Code 不用重包 Docker 就能生效
-    volumes:
-      - .:/app
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: genagent_chroma
+    ports:
+      - "8000:8000"
     environment:
-      # 這行指令會把模型存到專案的 data/hf_cache 資料夾，永久保存
-      - HF_HOME=/app/data/hf_cache
-      # 確保 Python 輸出不被緩衝 (讓你即時看到 log)
-      - PYTHONUNBUFFERED=1
-    # === 關鍵設定：開啟互動模式 ===
-    stdin_open: true # 相當於 -i (Interactive)
-    tty: true        # 使用 host 模式可以確保容器能順利連接外部 Internet
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      # 將資料掛載到本地資料夾，方便備份或重置
+      - ./chroma_db_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# 不需要 build，直接 pull 官方 image
