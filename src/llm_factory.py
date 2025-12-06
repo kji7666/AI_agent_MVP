@@ -12,23 +12,22 @@ from src.config import config
 
 class NCKUCustomLLM(BaseChatModel):
     """
-    [暴力封裝版]
-    直接使用官方 ollama library 連接 NCKU，完全繞過 langchain-ollama 的連線邏輯。
-    這保證了 Header 一定會被發送，因為這是你原本驗證過可行的程式碼。
+    LangChain → NCKUCustomLLM() → 直接觸發 Ollama API → NCKU Server
+    直接使用官方 ollama library 連接 NCKU, 完全繞過 langchain-ollama 的連線邏輯。
+    這保證了 Header 一定會被發送。
+    1. 繼承 BaseChatModel
+    2. 實作 generate
     """
     model_name: str = Field(default=config.LLM_MODEL)
     temperature: float = Field(default=0.7)
-    
-    # 定義私有屬性存放 client，避免 Pydantic 序列化錯誤
-    _client: ollama.Client = PrivateAttr()
+    _client: ollama.Client = PrivateAttr() # 不備序列化, 因為有 key
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # 這裡是你原本驗證過可行的連線程式碼
         self._client = ollama.Client(
             host=config.LLM_HOST,
             headers={'Authorization': f'Bearer {config.LLM_API_KEY}'},
-            timeout=120  # 設定超時避免卡住
+            timeout=120
         )
 
     def _generate(
@@ -38,9 +37,14 @@ class NCKUCustomLLM(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
-        """實作 LangChain 的生成介面"""
+        """
+        實作 LangChain 的生成介面
+        把 langChain 的參數格式改成 ollama dict
+        塞進 client.chat 取得 response
+        包裝成 LangChain 格式回傳
+        """
         
-        # 1. 轉換訊息格式 (LangChain Message -> Ollama Dict)
+        # 轉換訊息格式 (LangChain Message -> Ollama Dict)
         ollama_messages = []
         for msg in messages:
             role = "user"
@@ -54,7 +58,7 @@ class NCKUCustomLLM(BaseChatModel):
                 "content": msg.content
             })
 
-        # 2. 呼叫 NCKU API (使用官方 Client)
+        # 呼叫 NCKU API (使用官方 Client)
         try:
             response = self._client.chat(
                 model=self.model_name,
@@ -64,10 +68,8 @@ class NCKUCustomLLM(BaseChatModel):
                 }
             )
             
-            # 3. 取回結果
             generated_text = response['message']['content']
             
-            # 4. 包裝成 LangChain 格式回傳
             return ChatResult(
                 generations=[ChatGeneration(message=AIMessage(content=generated_text))]
             )
