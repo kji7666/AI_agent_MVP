@@ -1,5 +1,8 @@
-data/hf_cache/
-.env
 __pycache__/
 *.pyc
+.env
 .DS_Store
+chroma_db_data/
+venv/
+.idea/
+.vscode/
