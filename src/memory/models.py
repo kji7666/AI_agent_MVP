@@ -6,6 +6,8 @@ class Memory(BaseModel):
     """
     代表一條記憶單元 (Observation, Reflection, or Plan)
     """
+    # field : Metadata 描述, 可以給預設值 / 驗證規則, default_factory 
+    # description : 在 LangChain 解析 JSON 時，Pydantic 會自動輸出這些描述文字
     id: str = Field(description="Unique UUID for the memory")
     content: str = Field(description="The natural language description")
     created_at: datetime = Field(description="When this memory was formed")

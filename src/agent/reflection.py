@@ -6,42 +6,29 @@ from src.memory.retriever import GenerativeRetriever
 class Reflector:
     def __init__(self, retriever: GenerativeRetriever):
         self.retriever = retriever
-        self.llm = get_llm(temperature=0.5) # 反思需要一點創意
+        self.llm = get_llm(temperature=0.5)
 
-    def run(self, agent_name: str, last_k: int = 20):
-        """
-        執行反思程序：
-        1. 撈取最近 k 條尚未反思過的記憶
-        2. 請 LLM 歸納
-        3. 將歸納結果 (Insight) 寫回記憶庫
-        """
-        print(f"🤔 {agent_name} is reflecting on recent events...")
+    async def run(self, agent_name: str, last_k: int = 20):
+        print(f"🤔 {agent_name} 正在反思最近發生的事...")
         
-        # 1. 為了簡化 MVP，我們直接撈取最近的記憶 (不論是否反思過)
-        # 在完整版中，我們應該記錄一個 'last_reflected_time' 指標
-        recent_memories = self.retriever.retrieve(
-            query=f"What happened to {agent_name} recently?",
+        recent_memories = await self.retriever.retrieve(
+            query=f"{agent_name} 最近發生了什麼事?",
             k=last_k,
             fetch_k=last_k * 2
         )
         
         if not recent_memories:
-            print("   No memories to reflect on.")
+            print("   沒有足夠的記憶可供反思。")
             return
 
-        # 將記憶轉為文字清單
         observations = [m.page_content for m in recent_memories]
         observations_str = "\n".join([f"- {o}" for o in observations])
 
-        # 2. 呼叫 LLM 進行歸納
-        # 論文技巧：Ask "What high-level insights can you infer?"
         prompt = ChatPromptTemplate.from_template("""
         {observations}
         
-        Given only the information above, what are 3 most salient high-level insights 
-        we can infer about {agent_name}?
-        
-        Respond with 3 distinct sentences, one per line. Do not include numbering.
+        僅根據以上資訊，我們可以推斷出關於 {agent_name} 的哪 3 個最重要的高層次洞察 (Insights)？
+        請用繁體中文回答，列出 3 個不同的句子，每行一句。不要包含編號。
         """)
         
         chain = prompt | self.llm
@@ -51,19 +38,16 @@ class Reflector:
                 "observations": observations_str, 
                 "agent_name": agent_name
             })
-            insights = response.content.strip().split('\n')
+            insights = response.content.strip().split('\n') # 列出 3 個不同的句子，每行一句 => \n split
             
-            # 3. 將 Insight 存回記憶庫
             for insight in insights:
                 insight = insight.strip()
-                # 去除可能的編號 (1. 2. - 等)
-                if insight and len(insight) > 10: 
-                    print(f"   💡 Insight generated: {insight}")
-                    # 寫入時標記 type='reflection'
-                    self.retriever.add_memory(
+                if insight and len(insight) > 5: 
+                    print(f"   💡 生成洞察: {insight}")
+                    await self.retriever.add_memory(
                         content=insight,
                         type="reflection"
                     )
                     
         except Exception as e:
-            print(f"❌ Reflection failed: {e}")
+            print(f"❌ 反思失敗: {e}")

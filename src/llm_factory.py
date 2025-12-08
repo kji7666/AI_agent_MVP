@@ -18,17 +18,19 @@ class NCKUCustomLLM(BaseChatModel):
     1. 繼承 BaseChatModel
     2. 實作 generate
     """
+    # LangChain 會嘗試將 模型的屬性轉成 JSON / dict (序列化)
     model_name: str = Field(default=config.LLM_MODEL)
     temperature: float = Field(default=0.7)
-    _client: ollama.Client = PrivateAttr() # 不備序列化, 因為有 key
+    _client: ollama.Client = PrivateAttr() # 設定不被序列化, 因為有 key
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._client = ollama.Client(
             host=config.LLM_HOST,
             headers={'Authorization': f'Bearer {config.LLM_API_KEY}'},
-            timeout=120
+            timeout=180
         )
+        # client 就是一個「用來連線到遠端服務的物件」把「發送請求 → 收到回應」這件事包裝起來
 
     def _generate(
         self,
@@ -75,8 +77,7 @@ class NCKUCustomLLM(BaseChatModel):
             )
             
         except Exception as e:
-            # 錯誤處理：印出詳細資訊方便除錯
-            print(f"❌ NCKU API Error: {e}")
+            print(f"NCKU API Error: {e}")
             raise e
 
     @property
@@ -84,14 +85,12 @@ class NCKUCustomLLM(BaseChatModel):
         return "ncku-custom-wrapper"
 
 # ==========================================
-# 工廠函數
+# factory function
 # ==========================================
 
 def get_llm(temperature=0.7, json_mode=False):
     """
-    回傳我們自製的 NCKU Wrapper。
-    註：gpt-oss:120b 目前對於 JSON mode 的支援可能不一，
-    這裡我們先回傳一般模式，靠 Prompt Engineering 強制它輸出 JSON。
+    回傳我們自製的 NCKU Wrapper
     """
     return NCKUCustomLLM(
         model_name=config.LLM_MODEL,

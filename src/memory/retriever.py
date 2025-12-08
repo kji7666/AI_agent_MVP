@@ -1,7 +1,8 @@
+import asyncio
 import uuid
-from datetime import datetime
-from typing import List
 import numpy as np
+from datetime import datetime
+from typing import List, Optional
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -11,32 +12,117 @@ from src.memory.importance import get_importance_scorer
 from src.llm_factory import get_embeddings
 
 class GenerativeRetriever:
+    """
+    add_memory (新增記憶) ---> 寫入 DB
+
+    retriever (回想) ---> 更新 last_access_time
+                           |
+                           +--> push memory.id 到 update_queue (可選)
+    _background_flusher (背景守護) ---> 取出 queue 中的 id
+                                        |
+                                        +--> asyncio.to_thread(_batch_update_access_time)
+    _batch_update_access_time (同步) ---> 讀取 metadata -> 更新 last_accessed_at -> 寫回 DB
+    """
     def __init__(self, collection_name: str, decay_factor: float = 0.995):
+        """
+        初始化檢索器
+        Args:
+            collection_name: ChromaDB 的集合名稱
+            decay_factor: 記憶遺忘係數 (論文預設 0.995)
+        """
+        # 用來將文字轉成向量 (vector) 儲存於向量資料庫中。
         self.embeddings = get_embeddings()
+        
+        # 初始化 Chroma Vector Database (向量搜尋使用 cosine similarity)
         self.vector_store = Chroma(
             collection_name=collection_name,
             embedding_function=self.embeddings,
-            client_settings=None, # 使用 Docker 預設
-            collection_metadata={"hnsw:space": "cosine"}
+            client_settings=None, 
+            collection_metadata={"hnsw:space": "cosine"} # 使用餘弦相似度
         )
+        
+        # 使用本地小模型的評分器
         self.importance_scorer = get_importance_scorer()
-        self.decay_factor = decay_factor # 論文中的遺忘係數
+        # 記憶衰退係數
+        self.decay_factor = decay_factor
+        
+        # 存放待更新記憶，不阻塞主執行流程
+        self.update_queue = asyncio.Queue()
+        # 建立背景工作任務，持續處理更新佇列 → 將更新後的記憶批量寫回 Chroma
+        self.flusher_task = asyncio.create_task(self._background_flusher())
+        print(f"🚀 [Retriever] Initialized with Async Write-back & Local LLM Scoring.")
 
-    def add_memory(self, content: str, created_at: datetime = None, type: str = "observation"):
+    async def _background_flusher(self):
         """
-        新增記憶：自動計算 Embedding 與 Importance
+        [Background Task] 定期將 last_accessed_at 寫回 DB
+        避免檢索時因為寫入 DB 而變慢。
+        """
+        while True:
+            try:
+                ids_to_update = []
+                # 嘗試將 Queue 中的所有任務取出
+                while not self.update_queue.empty():
+                    ids_to_update.append(self.update_queue.get_nowait())
+                
+                if ids_to_update:
+                    # 避免同一個 ID 被多次更新, 去重複
+                    unique_ids = list(set(ids_to_update))
+                    current_time = datetime.now().timestamp()
+                    
+                    # ChromaDB 寫入是 同步 & 阻塞式 I/O, 要 await (需放入其他 thread 避免阻塞)
+                    await asyncio.to_thread(self._batch_update_access_time, unique_ids, current_time)
+                    
+                # 每 5 秒 loop 一次
+                await asyncio.sleep(5)
+                
+            except asyncio.CancelledError:
+                print("Flusher task cancelled.")
+                break
+            except Exception as e:
+                print(f"Flusher Error: {e}")
+                await asyncio.sleep(5)
+
+    def _batch_update_access_time(self, ids: List[str], timestamp: float):
+        """同步的 Chroma 批量更新邏輯 (被上面的 async 包裝)"""
+        try:
+            # 必須先取出 metadata 的其他欄位，因為 update time 會覆蓋整個 metadata
+            existing_data = self.vector_store.get(ids=ids)
+            
+            if existing_data and existing_data['ids']:
+                new_metadatas = []
+                for meta in existing_data['metadatas']:
+                    # 更新時間戳
+                    meta['last_accessed_at'] = timestamp
+                    new_metadatas.append(meta)
+                
+                # 寫回 DB
+                self.vector_store.update_documents(
+                    ids=existing_data['ids'],
+                    metadatas=new_metadatas
+                )
+        except Exception as e:
+            print(f"   ⚠️ Chroma Update Failed: {e}")
+
+    async def add_memory(self, content: str, created_at: datetime = None, type: str = "observation"):
+        """
+        [Async] 新增記憶
+        1. 呼叫本地 LLM 評分 (Fast)
+        2. 寫入 Vector DB
         """
         if created_at is None:
             created_at = datetime.now()
 
-        # 1. 呼叫 LLM 計算重要性
+        # 計算重要性
+        # 使用 to_thread 避免 invoke 阻塞 Event Loop
         try:
-            score = self.importance_scorer.invoke({"memory_content": content})
+            score = await asyncio.to_thread(
+                self.importance_scorer.invoke, # blocking method
+                {"memory_content": content} # method param
+            )
         except Exception as e:
-            print(f"   ⚠️ Scoring failed, defaulting to 5. Error: {e}")
-            score = 5
+            print(f"   ⚠️ Scoring failed, defaulting to 1. Error: {e}")
+            score = 1
 
-        # 2. 建立記憶物件
         memory = Memory(
             id=str(uuid.uuid4()),
             content=content,
@@ -45,90 +131,79 @@ class GenerativeRetriever:
             importance=score,
             type=type
         )
-
-        # 3. 寫入 Vector DB
+        
+        # 寫入 Vector DB (Async)
         payload = memory.to_chroma_payload()
-        self.vector_store.add_documents([
-            Document(page_content=payload["page_content"], metadata=payload["metadata"])
-        ])
-        print(f"   ✅ Saved Memory (Score: {score}): {content}")
+        await asyncio.to_thread(
+            self.vector_store.add_documents,
+            [Document(page_content=payload["page_content"], metadata=payload["metadata"])]
+        )
 
-    def retrieve(self, query: str, now: datetime = None, k: int = 5, fetch_k: int = 100) -> List[Document]:
+
+    async def retrieve(self, query: str, now: datetime = None, k: int = 5, fetch_k: int = 100) -> List[Document]:
         """
-        混合檢索核心邏輯：
-        1. 先用 Vector Search 抓取 Top-100 (Relevance)
-        2. 計算 Recency 與 Importance
-        3. 加權總分排序，回傳 Top-K
+        [Async] 混合檢索核心邏輯
         """
         if now is None:
             now = datetime.now()
 
-        # 1. 向量檢索 (Relevance) - 抓取較大範圍的候選集
-        # results_with_score 回傳 (Document, distance)
-        # Cosine Distance 越小越好，我們轉成 Similarity (1 - dist)
-        candidates = self.vector_store.similarity_search_with_score(query, k=fetch_k)
+        # 向量檢索 (Relevance) - 抓取較大範圍的候選集
+        # 使用 to_thread 因為 similarity_search 是同步且耗時的
+        candidates = await asyncio.to_thread(
+            self.vector_store.similarity_search_with_score,
+            query,
+            k=fetch_k
+        )
 
         if not candidates:
             return []
 
-        # 2. 準備特徵向量
-        relevance_scores = []
+        # 計算混合分數
+        # 論文公式: Score = a*Recency + b*Importance + c*Relevance
+        docs = [doc for doc, _ in candidates]
+        # A. Relevance (Similarity)
+        # Chroma 回傳的是 Distance (0~2)，轉為 Similarity
+        relevance_scores = [1.0 - dist for _, dist in candidates]
+        # B. Importance (1-10 -> 0-1)
+        importance_scores = [doc.metadata.get("importance", 1) / 10.0 for doc in docs]
+        # C. Recency (Decay Factor)
         recency_scores = []
-        importance_scores = []
-        
-        docs = []
-
-        for doc, distance in candidates:
-            docs.append(doc)
-            
-            # A. Relevance (歸一化到 0-1)
-            # Chroma Cosine distance 範圍通常是 0~2，這裡簡單轉為相似度 sim
-            sim = 1 - distance
-            relevance_scores.append(sim)
-            
-            # B. Importance (正規化 1-10 -> 0-1)
-            imp = doc.metadata.get("importance", 1)
-            importance_scores.append(imp / 10.0)
-            
-            # C. Recency (指數衰減)
-            # 論文公式：decay_factor ^ (hours_passed)
-            last_accessed = datetime.fromtimestamp(doc.metadata.get("last_accessed_at"))
+        for doc in docs:
+            last_accessed_ts = doc.metadata.get("last_accessed_at", now.timestamp())
+            last_accessed = datetime.fromtimestamp(last_accessed_ts)
             hours_passed = (now - last_accessed).total_seconds() / 3600
+            hours_passed = max(0, hours_passed)
             recency = self.decay_factor ** hours_passed
             recency_scores.append(recency)
 
-        # 3. 歸一化 (Min-Max Scaling)
-        # 讓三個指標都在 0-1 之間，這樣加權才有意義
+        #  (Min-Max Scaling)
         def normalize(arr):
-            arr = np.array(arr)
-            if np.max(arr) == np.min(arr): return arr # 避免除以零
-            return (arr - np.min(arr)) / (np.max(arr) - np.min(arr))
+            a = np.array(arr)
+            if np.max(a) == np.min(a):
+                return a # 如果數值都一樣，就不縮放
+            return (a - np.min(a)) / (np.max(a) - np.min(a))
 
-        # 注意：雖然上面已經做了簡單正規化，但為了讓混合分數分佈更廣，
-        # 我們通常會對這群 candidates 再做一次 min-max
         norm_recency = normalize(recency_scores)
         norm_importance = normalize(importance_scores)
         norm_relevance = normalize(relevance_scores)
 
-        # 4. 計算總分
-        # 論文權重：alpha=1, beta=1, gamma=1 (可調整)
+        # 加權總分 (權重可調整)
         alpha, beta, gamma = 1.0, 1.0, 1.0
         total_scores = (alpha * norm_recency) + (beta * norm_importance) + (gamma * norm_relevance)
 
         # 5. 排序並取出 Top-K
-        # argsort 回傳的是從小到大的 index，所以要反轉 [::-1]
+        # argsort 是從小到大，所以用 [::-1] 反轉
         top_indices = np.argsort(total_scores)[::-1][:k]
         
         final_results = []
         for idx in top_indices:
             doc = docs[idx]
-            # 更新 last_accessed_at (因為被想起來了)
-            # 這裡暫時不寫回 DB 以免拖慢速度，但在完整系統中應該要更新
-            # doc.metadata['last_accessed_at'] = now.timestamp()
             final_results.append(doc)
             
-            # Debug 輸出，讓你看到分數是怎麼算出來的
-            print(f"   🔍 Rank {len(final_results)}: {doc.page_content}")
-            print(f"      Scores -> Recency: {norm_recency[idx]:.2f}, Imp: {norm_importance[idx]:.2f}, Rel: {norm_relevance[idx]:.2f} | Total: {total_scores[idx]:.2f}")
+            # 將此 ID 加入更新佇列
+            # 我們不等待它寫入，直接繼續
+            doc_id = doc.metadata.get("id")
+            if doc_id:
+                await self.update_queue.put(doc_id)
 
         return final_results

@@ -8,13 +8,20 @@ class AgentState(TypedDict):
     agent_summary: str
     
     # --- 動態環境 ---
-    current_time: str
-    observations: List[str]  # 這一輪看到的環境變化
+    current_time: str # 格式必須為 "%Y-%m-%d %I:%M %p"
+    observations: List[str]
     
     # --- 內部狀態 ---
-    relevant_memories: List[Document] # 這一輪檢索到的記憶
-    daily_plan: List[Dict] # 當天的計畫 (從 Planning 模組生成)
+    relevant_memories: List[Document]
+    daily_plan: List[Dict]      # L1 長期計畫
+    short_term_plan: List[Dict] # L2 短期細節
     
+    # 格式: "2025-06-01 09:30 AM"
+    busy_until: Optional[str] 
+    
+    # 用於內部 Graph 流程控制 (不會存入 DB)
+    skip_thinking: Optional[bool]
+
     # --- 輸出 ---
-    current_action: Optional[str] # 代理人決定做什麼
-    current_emoji: Optional[str]  # 動作對應的表情符號 (增加趣味性)
+    current_action: Optional[str]
+    current_emoji: Optional[str]
