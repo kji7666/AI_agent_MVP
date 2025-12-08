@@ -139,6 +139,7 @@ class GenerativeRetriever:
             [Document(page_content=payload["page_content"], metadata=payload["metadata"])]
         )
 
+        
 
     async def retrieve(self, query: str, now: datetime = None, k: int = 5, fetch_k: int = 100) -> List[Document]:
         """
