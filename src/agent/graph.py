@@ -214,7 +214,10 @@ class GenerativeAgent:
         print(f"   🤔 決定行動...")
         memories_text = "\n".join([f"- {m.page_content}" for m in state["relevant_memories"]])
         
+        # 取得短期計畫與每日計畫
         short = state.get("short_term_plan", [])
+        daily = state.get("daily_plan", [])
+        
         plan_ctx = f"當前細項: {short[0]['description']}" if short else "無具體細項"
         world_desc = state.get("world_map_desc", "")
 
@@ -257,25 +260,67 @@ class GenerativeAgent:
                 "plan_ctx": plan_ctx, "observations": state["observations"], "world_desc": world_desc
             })
             
-            # 計算忙碌時間
+            # --- 1. 計算時間與狀態 ---
             dur = res.get("duration", 15)
-            curr_dt = datetime.strptime(state["current_time"], "%Y-%m-%d %I:%M %p")
-            busy_until = (curr_dt + timedelta(minutes=dur)).strftime("%Y-%m-%d %I:%M %p")
+            if dur < 15: dur = 15 # 確保最小耗時
+            
+            time_fmt = "%Y-%m-%d %I:%M %p"
+            curr_dt = datetime.strptime(state["current_time"], time_fmt)
+            
+            # 計算動作結束的時間點
+            action_end_dt = curr_dt + timedelta(minutes=dur)
+            busy_until = action_end_dt.strftime(time_fmt)
             
             print(f"   🎬 {res['emoji']} {res['action']} ({dur}min)")
             await self.retriever.add_memory(f"{state['agent_name']} {res['action']}", type="observation")
             
+            # --- 2. 處理計畫變更 (重規劃 vs 任務推進) ---
+            final_daily_plan = daily # 預設維持原樣
+            
+            # 情況 A: LLM 決定重規劃
             if res.get("should_replan"):
-                # 這裡簡化：若重規劃，清空短期計畫
-                short = []
+                print(f"   ⚠️ 偵測到重規劃需求...")
+                new_schedule = await self.planner.update_plan(
+                    state["agent_name"], daily, state["current_time"], res['action']
+                )
+                if new_schedule:
+                    final_daily_plan = [item.dict() for item in new_schedule]
+                    short = [] # 重規劃後，舊的短期細節作廢
+            
+            # 情況 B: [新增] 推進短期計畫
+            # 如果沒有重規劃，且手上有短期任務，檢查是否完成
+            elif short:
+                current_subtask = short[0]
+                try:
+                    # 解析任務結束時間 (格式通常是 HH:MM)
+                    task_end_str = current_subtask['end_time'].replace("：", ":")
+                    today_str = curr_dt.strftime("%Y-%m-%d")
+                    task_end_dt = datetime.strptime(f"{today_str} {task_end_str}", "%Y-%m-%d %H:%M")
+                    
+                    # 判定：如果「動作做完的時間」 >= 「任務表定結束時間」
+                    if action_end_dt >= task_end_dt:
+                        removed = short.pop(0) # 移除第一項
+                        print(f"   ✅ 完成細項: {removed['description']} (進度: {busy_until})")
+                        
+                        if short:
+                            print(f"   🔜 下一項: {short[0]['description']}")
+                    else:
+                        print(f"   ▶️ 任務進行中: {current_subtask['description']}")
+                        
+                except ValueError:
+                    # 如果時間格式解析失敗，保守起見不移除，讓下一次 perceive_node 決定
+                    pass
             
             return {
-                "current_action": res['action'], "current_emoji": res['emoji'],
+                "current_action": res['action'], 
+                "current_emoji": res['emoji'],
                 "target_location_id": res.get("target_location_id"),
                 "target_object_id": res.get("target_object_id"),
                 "busy_until": busy_until,
-                "short_term_plan": short
+                "daily_plan": final_daily_plan, # 回傳可能更新過的每日計畫
+                "short_term_plan": short        # 回傳可能更新過的短期計畫
             }
+            
         except Exception as e:
             print(f"❌ React Error: {e}")
             return {"current_action": "發呆", "busy_until": None}
