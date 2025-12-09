@@ -20,6 +20,7 @@ graph.py
         conti 的判定太草率
 
         沒有加入 reflection
-        
+
 ## new idea
 身分 prompt 要能隨著 reflection 改變
+從 plan 驅動改為 LLM 隨時決定

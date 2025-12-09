@@ -1,5 +1,6 @@
 import json
 import asyncio
+import re 
 from datetime import datetime, timedelta
 from langgraph.graph import StateGraph, END
 from langchain_core.prompts import ChatPromptTemplate
@@ -51,150 +52,108 @@ class GenerativeAgent:
 
         return workflow.compile()
 
+# 輔助方法 (請放在 class 內)
     def _get_current_block(self, daily_plan: list, current_time_str: str):
-        """
-        [修正版] 找出當下應該執行的 Daily Plan Block
-        """
-        time_fmt = "%Y-%m-%d %I:%M %p"
+        """找出當下應該執行的 Daily Plan Block (包含結束時間計算)"""
         try:
-            curr_dt = datetime.strptime(current_time_str, time_fmt)
+            curr_dt = datetime.strptime(current_time_str, "%Y-%m-%d %I:%M %p")
             today_str = curr_dt.strftime("%Y-%m-%d")
-            
             active_block = None
             
-            # 我們需要找到一個 block，它的 start_time <= current_time
-            # 且它是所有符合條件中「最晚開始」的一個 (也就是最新的)
-            
             for i, block in enumerate(daily_plan):
+                t_str = block['start_time'].replace("：", ":")
                 try:
-                    # 處理時間格式 (容錯中文全形冒號)
-                    t_str = block['start_time'].replace("：", ":")
-                    
-                    # 補上日期進行比對
                     block_dt = datetime.strptime(f"{today_str} {t_str}", "%Y-%m-%d %H:%M")
-                    
-                    if block_dt <= curr_dt:
-                        # 找到了候選人
-                        active_block = block
-                        
-                        # 順便計算結束時間 (拿「下一個 block」的開始時間當作結束)
-                        if i + 1 < len(daily_plan):
-                            next_t_str = daily_plan[i+1]['start_time'].replace("：", ":")
-                            active_block["calculated_end_time"] = next_t_str
-                        else:
-                            # 如果是最後一個任務，假設 2 小時後結束
-                            end_dt = block_dt + timedelta(hours=2)
-                            active_block["calculated_end_time"] = end_dt.strftime("%H:%M")
-                            
+                except: continue
+                
+                if block_dt <= curr_dt:
+                    active_block = block
+                    # 計算結束時間：拿「下一個 block」的開始時間當作結束
+                    if i + 1 < len(daily_plan):
+                        next_t = daily_plan[i+1]['start_time'].replace("：", ":")
+                        active_block["calculated_end_time"] = next_t
                     else:
-                        # 因為 daily_plan 是照時間排序的
-                        # 一旦遇到一個 "未來" 的任務，就可以停止搜尋了
-                        # 此時 active_block 裡面存的就是「當下正在進行」的任務
-                        break
-                        
-                except ValueError:
-                    continue
-            
+                        active_block["calculated_end_time"] = (block_dt + timedelta(hours=2)).strftime("%H:%M")
+                else:
+                    # 遇到未來的任務就停止，因為 active_block 已鎖定最新的過去任務
+                    break
             return active_block
+        except: return None
 
-        except Exception as e:
-            print(f"   ⚠️ 時間解析錯誤: {e}")
-            return None
-        
+    # Perceive Node 核心
     async def perceive_node(self, state: AgentState):
-        """
-        感知節點：
-        1. 儲存觀察。
-        2. 檢查是否還在執行 plan
-        3. 沒有的話, "填入"下一個 plan
-        """
         print(f"\n👀 {state['agent_name']} 正在感知世界...")
         
-        # 1. 儲存觀察到記憶庫 (world 在 main 抽取後放入)
+        # 1. 儲存觀察
         for obs in state["observations"]:
             await self.retriever.add_memory(obs)
 
-        # 2. 檢查是否還在做事 (要做到 busy_until 結束)
+        # 2. 檢查是否忙碌 (Persistence Check)
+        # 目前使用簡單字串規則判斷是否為例行公事 (is_routine)
         busy_until = state.get("busy_until")
-        current_time_str = state["current_time"]
-        
         if busy_until:
             try:
-                # 解析時間 (必須與 main.py 格式一致)
-                time_fmt = "%Y-%m-%d %I:%M %p"
-                curr_dt = datetime.strptime(current_time_str, time_fmt)
-                busy_dt = datetime.strptime(busy_until, time_fmt)
+                curr_dt = datetime.strptime(state["current_time"], "%Y-%m-%d %I:%M %p")
+                busy_dt = datetime.strptime(busy_until, "%Y-%m-%d %I:%M %p")
                 
-                # 如果現在時間 < 忙碌結束時間
                 if curr_dt < busy_dt:
-                    # 檢查是否有「重大事件」打斷
-                    # 簡單判定：如果觀察只有"環境描述" ("你現在位於...", "這裡有一個...")，就不打斷
-                    # 如果有其他訊息 (e.g. "Fire!", "Maria is talking to you")，視為打斷
+                    # 簡單判定：如果觀察只有基本環境描述，就不打斷
+                    # (這裡是你提到的"脆弱"判斷，未來可用 Sentry 替換)
                     is_routine = all("你現在位於" in o or "這裡有一個" in o or "You are" in o or "There is" in o for o in state["observations"])
                     
                     if is_routine:
                         print(f"   ⏳ {state['agent_name']} 正在忙於上一個動作 (直到 {busy_until})，跳過思考。")
-                        return {"skip_thinking": True} # 給 conditional edge
+                        return {"skip_thinking": True}
                     else:
                         print(f"   ⚡ 偵測到新事件！中斷目前的動作！")
-                        # 清空 busy_until，強制重新思考
-                        # 注意：這裡不 return skip，而是繼續往下走
-            except ValueError as e:
-                print(f"   ⚠️ 時間格式解析錯誤: {e}，強制重新思考。")
-        
-        # --- 如果決定要思考，繼續執行下一個 plan(先看有沒有 plan) ---
+                        # 不 return skip，繼續往下走 (重置 busy_until)
+            except ValueError:
+                pass # 時間解析失敗則忽略忙碌狀態
 
-        current_daily_plan = state.get("daily_plan", [])
-        short_term_plan = state.get("short_term_plan", [])
-        
-        #  取得上一次紀錄正在做的大任務，用於比對
+        # 3. 準備狀態變數
+        daily = state.get("daily_plan", [])
+        short = state.get("short_term_plan", [])
         last_activity = state.get("current_daily_block_activity")
 
-        # 3. 處理 粗略計畫 (Daily Plan)
-        if not current_daily_plan:
+        # 4. 處理 L1 粗略計畫 (Daily Plan)
+        if not daily:
             print("   📅 沒找到計畫。正在生成動態行程...")
             plan_items = await self.planner.create_initial_plan(
                 state["agent_name"], state["agent_summary"], state["current_time"]
             )
-            current_daily_plan = [item.dict() for item in plan_items]
+            daily = [item.dict() for item in plan_items]
 
-        # 4. [修正] 處理 細分分解 (Decomposition)
-        # 先找出現在時間對應的大任務
-        current_block = self._get_current_block(current_daily_plan, current_time_str)
-        
+        # 5. 處理 L2 細分分解 (Decomposition) & 任務切換
+        curr_block = self._get_current_block(daily, state["current_time"])
         current_activity_name = None
-        if current_block:
-            current_activity_name = current_block['activity']
+
+        if curr_block:
+            current_activity_name = curr_block['activity']
             
-            # [邏輯修正] 關鍵判斷：任務是否切換了？
-            # 如果 (有新任務) 且 (新任務 != 舊任務)
+            # [關鍵修正] 偵測任務是否切換
             if current_activity_name != last_activity:
                 print(f"   🔄 任務切換偵測: '{last_activity}' -> '{current_activity_name}'")
                 print(f"   🗑️ 清空過期的短期計畫，準備重新細分...")
-                short_term_plan = [] # 強制清空舊細節！
+                short = [] # 強制清空，觸發下方的分解邏輯
 
-        # 如果短期計畫是空的 (包含剛剛被我們強制清空的)，且有當前任務，就進行細分
-        if current_block and not short_term_plan:
-            print(f"   🔍 鎖定當前時段任務: {current_block['activity']}")
-            end_time = current_block.get("calculated_end_time", "Unknown")
-            
+        # 如果沒有短期計畫 (或剛被清空)，進行分解
+        if curr_block and not short:
+            print(f"   🔍 鎖定任務: {current_activity_name}")
             subtasks = await self.planner.decompose_activity(
                 state["agent_name"],
-                current_block['activity'],
-                current_block['start_time'],
-                end_time # 傳入計算出的結束時間
+                current_activity_name,
+                curr_block['start_time'],
+                curr_block.get("calculated_end_time", "Unknown")
             )
             if subtasks:
-                short_term_plan = [t.dict() for t in subtasks]
+                short = [t.dict() for t in subtasks]
 
-        # 清除 busy_until (因為要重新裝入下一個 plan)
         return {
-            "daily_plan": current_daily_plan,
-            "short_term_plan": short_term_plan,
+            "daily_plan": daily,
+            "short_term_plan": short,
             "busy_until": None, 
             "skip_thinking": False,
-            # 更新當前任務名稱到 State，供下一輪比對
-            "current_daily_block_activity": current_activity_name 
+            "current_daily_block_activity": current_activity_name # 更新當前任務
         }
 
     async def retrieve_node(self, state: AgentState):
@@ -212,33 +171,53 @@ class GenerativeAgent:
 
     async def react_node(self, state: AgentState):
         print(f"   🤔 決定行動...")
-        memories_text = "\n".join([f"- {m.page_content}" for m in state["relevant_memories"]])
         
-        # 取得短期計畫與每日計畫
+        # 1. 準備 Context
+        memories_text = "\n".join([f"- {m.page_content}" for m in state["relevant_memories"]])
+        world_desc = state.get("world_map_desc", "")
+        
         short = state.get("short_term_plan", [])
         daily = state.get("daily_plan", [])
         
-        plan_ctx = f"當前細項: {short[0]['description']}" if short else "無具體細項"
-        world_desc = state.get("world_map_desc", "")
+        # [修改] 將 Planner 指定的「建議地點」加入 Context
+        if short:
+            current_focus = short[0]
+            suggested_loc = current_focus.get('location', '未指定') # 取得地點
+            plan_ctx = (
+                f"[當前執行細項]\n"
+                f"時間: {current_focus['start_time']} - {current_focus['end_time']}\n"
+                f"任務: {current_focus['description']}\n"
+                f"建議地點: {suggested_loc}" # 明確告訴 LLM 該去哪
+            )
+        elif daily:
+            plan_ctx = f"[當前大方向]\n{json.dumps(daily[:1], indent=2, ensure_ascii=False)}"
+        else:
+            plan_ctx = "目前沒有具體計畫。"
 
+        # 2. 構建 Prompt
         prompt = ChatPromptTemplate.from_template("""
         你是 {agent_name}。背景: {agent_summary}。時間: {current_time}。
         
-        [地圖]
+        [地圖資訊]
         {world_desc}
-        [計畫]
+        
+        [當前計畫]
         {plan_ctx}
-        [記憶]
+        
+        [相關記憶]
         {memories}
-        [觀察]
+        
+        [目前的觀察]
         {observations}
         
         請決定你現在的行動。
         
-        **JSON 填寫範例 (請嚴格參考)**:
-        - 情況 A (移動): {{ "action": "前往廚房準備早餐", "target_location_id": "kitchen", "target_object_id": null, ... }}
-        - 情況 B (操作物品): {{ "action": "使用咖啡機", "target_location_id": null, "target_object_id": "coffee_machine", ... }}
-        - 情況 C (原地發呆): {{ "action": "發呆", "target_location_id": null, "target_object_id": null, ... }}
+        **導航與行動規則 (請嚴格遵守)**:
+        1. **優先檢查地點**：看一眼 [當前計畫] 的「建議地點」。如果你現在不在那個地點，請優先設定 `target_location_id` 移動過去。
+        2. **到達後操作**：如果你已經在正確地點，則尋找該地點的物品進行操作 (設定 `target_object_id`)。
+        3. **填寫 JSON**:
+           - 移動時: `target_location_id` 填 ID (如 'bedroom'), `target_object_id` 填 null。
+           - 操作時: `target_location_id` 填 null, `target_object_id` 填 ID (如 'bed')。
         
         請輸出 JSON (不要包含 Markdown):
         {{
@@ -252,79 +231,94 @@ class GenerativeAgent:
         }}
         """)
         
-        chain = prompt | self.llm | JsonOutputParser()
-        try:
-            res = chain.invoke({
-                "agent_name": state["agent_name"], "agent_summary": state["agent_summary"],
-                "current_time": state["current_time"], "memories": memories_text,
-                "plan_ctx": plan_ctx, "observations": state["observations"], "world_desc": world_desc
-            })
-            
-            # --- 1. 計算時間與狀態 ---
-            dur = res.get("duration", 15)
-            if dur < 15: dur = 15 # 確保最小耗時
-            
-            time_fmt = "%Y-%m-%d %I:%M %p"
-            curr_dt = datetime.strptime(state["current_time"], time_fmt)
-            
-            # 計算動作結束的時間點
-            action_end_dt = curr_dt + timedelta(minutes=dur)
-            busy_until = action_end_dt.strftime(time_fmt)
-            
-            print(f"   🎬 {res['emoji']} {res['action']} ({dur}min)")
-            await self.retriever.add_memory(f"{state['agent_name']} {res['action']}", type="observation")
-            
-            # --- 2. 處理計畫變更 (重規劃 vs 任務推進) ---
-            final_daily_plan = daily # 預設維持原樣
-            
-            # 情況 A: LLM 決定重規劃
-            if res.get("should_replan"):
-                print(f"   ⚠️ 偵測到重規劃需求...")
-                new_schedule = await self.planner.update_plan(
-                    state["agent_name"], daily, state["current_time"], res['action']
-                )
-                if new_schedule:
-                    final_daily_plan = [item.dict() for item in new_schedule]
-                    short = [] # 重規劃後，舊的短期細節作廢
-            
-            # 情況 B: [新增] 推進短期計畫
-            # 如果沒有重規劃，且手上有短期任務，檢查是否完成
-            elif short:
-                current_subtask = short[0]
-                try:
-                    # 解析任務結束時間 (格式通常是 HH:MM)
-                    task_end_str = current_subtask['end_time'].replace("：", ":")
-                    today_str = curr_dt.strftime("%Y-%m-%d")
-                    task_end_dt = datetime.strptime(f"{today_str} {task_end_str}", "%Y-%m-%d %H:%M")
-                    
-                    # 判定：如果「動作做完的時間」 >= 「任務表定結束時間」
-                    if action_end_dt >= task_end_dt:
-                        removed = short.pop(0) # 移除第一項
-                        print(f"   ✅ 完成細項: {removed['description']} (進度: {busy_until})")
-                        
-                        if short:
-                            print(f"   🔜 下一項: {short[0]['description']}")
-                    else:
-                        print(f"   ▶️ 任務進行中: {current_subtask['description']}")
-                        
-                except ValueError:
-                    # 如果時間格式解析失敗，保守起見不移除，讓下一次 perceive_node 決定
-                    pass
-            
-            return {
-                "current_action": res['action'], 
-                "current_emoji": res['emoji'],
-                "target_location_id": res.get("target_location_id"),
-                "target_object_id": res.get("target_object_id"),
-                "busy_until": busy_until,
-                "daily_plan": final_daily_plan, # 回傳可能更新過的每日計畫
-                "short_term_plan": short        # 回傳可能更新過的短期計畫
-            }
-            
-        except Exception as e:
-            print(f"❌ React Error: {e}")
-            return {"current_action": "發呆", "busy_until": None}
+        # 3. 執行 LLM (包含重試機制)
+        chain = prompt | self.llm 
+        
+        import re # 確保有引入 re
+        max_retries = 3
+        
+        for attempt in range(max_retries):
+            try:
+                # Invoke
+                raw_response = chain.invoke({
+                    "agent_name": state["agent_name"], "agent_summary": state["agent_summary"],
+                    "current_time": state["current_time"], "memories": memories_text,
+                    "plan_ctx": plan_ctx, "observations": state["observations"], "world_desc": world_desc
+                })
+                
+                # Clean JSON
+                content = raw_response.content
+                if "```" in content:
+                    content = re.sub(r"```json\s*", "", content)
+                    content = re.sub(r"```", "", content)
+                content = content.strip()
 
+                # Parse
+                parser = JsonOutputParser()
+                res = parser.parse(content)
+                
+                # --- 邏輯處理 ---
+                
+                # 計算時間
+                dur = res.get("duration", 15)
+                if dur < 15: dur = 15
+                
+                time_fmt = "%Y-%m-%d %I:%M %p"
+                curr_dt = datetime.strptime(state["current_time"], time_fmt)
+                action_end_dt = curr_dt + timedelta(minutes=dur)
+                busy_until = action_end_dt.strftime(time_fmt)
+                
+                print(f"   🎬 {res.get('emoji', '🤖')} {res['action']} ({dur}min)")
+                
+                # 存記憶
+                await self.retriever.add_memory(f"{state['agent_name']} {res['action']}", type="observation")
+                
+                # A. 處理重規劃
+                final_daily_plan = daily
+                if res.get("should_replan"):
+                    print(f"   ⚠️ 偵測到重規劃需求...")
+                    new_schedule = await self.planner.update_plan(
+                        state["agent_name"], daily, state["current_time"], res['action']
+                    )
+                    if new_schedule:
+                        final_daily_plan = [item.dict() for item in new_schedule]
+                        short = [] 
+                
+                # B. 處理任務推進 (比對時間)
+                elif short:
+                    current_subtask = short[0]
+                    try:
+                        task_end_str = current_subtask['end_time'].replace("：", ":")
+                        today_str = curr_dt.strftime("%Y-%m-%d")
+                        # 這裡假設 end_time 格式正確，若有跨日需額外處理，目前簡化
+                        task_end_dt = datetime.strptime(f"{today_str} {task_end_str}", "%Y-%m-%d %H:%M")
+                        
+                        # 如果動作結束時間 >= 任務結束時間，視為完成
+                        if action_end_dt >= task_end_dt:
+                            removed = short.pop(0)
+                            print(f"   ✅ 完成細項: {removed['description']} (地點: {removed.get('location', '未指定')})")
+                            if short: print(f"   🔜 下一項: {short[0]['description']} @ {short[0].get('location')}")
+                        else:
+                            print(f"   ▶️ 任務進行中: {current_subtask['description']}")
+                    except ValueError:
+                        pass
+                
+                return {
+                    "current_action": res['action'], 
+                    "current_emoji": res.get("emoji", "🤖"),
+                    "target_location_id": res.get("target_location_id"),
+                    "target_object_id": res.get("target_object_id"),
+                    "busy_until": busy_until,
+                    "daily_plan": final_daily_plan,
+                    "short_term_plan": short
+                }
+
+            except Exception as e:
+                print(f"   ⚠️ JSON 解析或執行失敗 (嘗試 {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    print(f"   ❌ 放棄思考，執行發呆。")
+                    return {"current_action": "發呆", "busy_until": None}
+    
     def interview(self, question: str):
         # 簡單的同步接口，實際應使用 async
         pass
