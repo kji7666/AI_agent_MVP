@@ -24,3 +24,6 @@ graph.py
 ## new idea
 身分 prompt 要能隨著 reflection 改變
 從 plan 驅動改為 LLM 隨時決定
+說話時要有裡外思考
+
+問題是記憶
