@@ -17,7 +17,7 @@ class SubTask(BaseModel):
     start_time: str = Field(description="HH:MM")
     end_time: str = Field(description="HH:MM")
     description: str = Field(description="具體的細項動作")
-
+    location: str = Field(description="執行此動作的最佳地點 ID (例如: bedroom, kitchen, library)")
 class DetailedRoutine(BaseModel):
     subtasks: List[SubTask]
 
@@ -220,30 +220,24 @@ class Planner:
             return []
         
     async def decompose_activity(self, agent_name: str, activity: str, start_time: str, end_time: str):
-        """
-        遞迴分解：將一個長時間的粗略活動，細分為短時間的具體執行步驟。
-        """
-        print(f"🔨 {agent_name} 正在細分活動: '{activity}' ({start_time} - {end_time})...")
+        print(f"🔨 細分活動: {activity} ({start_time}-{end_time})")
         
         parser = PydanticOutputParser(pydantic_object=DetailedRoutine)
 
+        # [修改] Prompt: 要求包含地點 ID
         template = """
         你是 {agent_name}。
-        你原本的計畫是在 {start_time} 到 {end_time} 進行 "{activity}"。
+        大任務: {activity} ({start_time} - {end_time})。
         
-        請將這個時段細分為更具體、可執行的子任務 (Sub-tasks)。
-        每個子任務大約 15-60 分鐘。
-        確保子任務加總起來的時間涵蓋整個時段。
-        
-        請使用繁體中文回答。
+        請將此時段細分為具體子任務。
+        對於每個子任務，**務必指定最適合的地點 ID** (參考: bedroom, kitchen, library, lecture_hall)。
+        例如：如果是「睡覺」，地點 ID 應為 "bedroom"。如果是「做飯」，地點 ID 應為 "kitchen"。
         
         {format_instructions}
         """
         
-        prompt = ChatPromptTemplate.from_template(template)
-        chain = prompt | self.llm | parser
-        
         try:
+            chain = ChatPromptTemplate.from_template(template) | self.llm | parser
             result = chain.invoke({
                 "agent_name": agent_name,
                 "activity": activity,
@@ -252,17 +246,17 @@ class Planner:
                 "format_instructions": parser.get_format_instructions()
             })
             
-            # Log
-            for task in result.subtasks:
-                print(f"   ↳ 🔨 {task.start_time}-{task.end_time}: {task.description}")
+            # Log 顯示地點
+            for t in result.subtasks: 
+                print(f"   ↳ {t.start_time}: {t.description} @ {t.location}")
             
-            # 存入記憶 (讓 Agent 記得自己規劃了細節)
-            detail_text = f"針對 {start_time} 的 '{activity}'，我規劃了細節:\n" + \
-                          "\n".join([f"- {t.start_time}: {t.description}" for t in result.subtasks])
+            # 存入記憶
+            detail_text = f"細部計畫 ({start_time}):\n" + \
+                          "\n".join([f"- {t.start_time}: {t.description} (在 {t.location})" for t in result.subtasks])
             await self.retriever.add_memory(content=detail_text, type="plan")
 
             return result.subtasks
             
         except Exception as e:
-            print(f"❌ 細分失敗: {e}")
+            print(f"❌ Decompose Error: {e}")
             return []

@@ -1,70 +1,76 @@
-# src/world/environment.py
-
-from typing import Dict, List, Optional
-from pydantic import BaseModel
-
-class WorldObject(BaseModel):
-    id: str
-    name: str
-    state: str = "閒置" # 改中文預設值
-    position: str 
-
-class Location(BaseModel):
-    name: str
-    objects: Dict[str, WorldObject] = {}
+import json
+import os
+from typing import List, Dict, Any
 
 class World:
-    def __init__(self):
-        self.locations: Dict[str, Location] = {}
-        # 👇 [新增] 追蹤所有 Agent 的位置 {agent_name: location_id}
-        self.agent_positions: Dict[str, str] = {} 
-        self._init_smallville()
-
-    def _init_smallville(self):
-        # ... (地點初始化保持不變，確保有 Kitchen, Bedroom, Library, Lecture Hall) ...
-        # 建議複製上一輪修改過的中文版 _init_smallville
-        kitchen = Location(name="廚房")
-        kitchen.objects["stove"] = WorldObject(id="stove", name="瓦斯爐", position="廚房", state="關閉")
-        kitchen.objects["fridge"] = WorldObject(id="fridge", name="冰箱", position="廚房", state="滿的")
-        kitchen.objects["coffee_machine"] = WorldObject(id="coffee_machine", name="咖啡機", position="廚房", state="閒置")
-        self.locations["Kitchen"] = kitchen
-
-        bedroom = Location(name="臥室")
-        bedroom.objects["bed"] = WorldObject(id="bed", name="床", position="臥室", state="鋪好的")
-        bedroom.objects["desk"] = WorldObject(id="desk", name="書桌", position="臥室", state="雜亂")
-        self.locations["Bedroom"] = bedroom
-
-        library = Location(name="圖書館")
-        library.objects["bookshelf"] = WorldObject(id="bookshelf", name="書架", position="圖書館", state="滿的")
-        self.locations["Library"] = library
-
-        lecture_hall = Location(name="大學講堂")
-        lecture_hall.objects["projector"] = WorldObject(id="projector", name="投影機", position="大學講堂", state="關閉")
-        self.locations["Lecture Hall"] = lecture_hall
-
-    # 👇 [新增] 用來設定 Agent 初始位置或移動 Agent
-    def move_agent(self, agent_name: str, new_location_id: str):
-        if new_location_id in self.locations:
-            self.agent_positions[agent_name] = new_location_id
-            return True
-        return False
-
-    # 👇 [修改] 感知功能：現在可以「看到」其他人了！
-    def get_observations(self, agent_name: str) -> List[str]:
-        # 取得該 Agent 的位置
-        current_loc_id = self.agent_positions.get(agent_name)
-        if not current_loc_id or current_loc_id not in self.locations:
-            return ["你目前不在任何已知的地方。"]
-        
-        loc = self.locations[current_loc_id]
-        obs = [f"你現在位於 {loc.name}。"]
-        
-        # 1. 看到物件
-        for obj in loc.objects.values():
-            obs.append(f"這裡有一個 {obj.name}，狀態是: {obj.state}。")
+    def __init__(self, config_path="world_config.json"):
+        # 容錯：嘗試在當前目錄或上一層目錄尋找設定檔
+        if not os.path.exists(config_path):
+            parent_path = os.path.join("..", config_path)
+            if os.path.exists(parent_path):
+                config_path = parent_path
+            else:
+                raise FileNotFoundError(f"找不到設定檔: {config_path}")
             
-        # 2. 👇 [新增] 看到其他人
-        # 遍歷所有 Agent，找出「也在同一個地點」且「不是自己」的人
+        with open(config_path, 'r', encoding='utf-8') as f:
+            self.config = json.load(f)
+            
+        # 建立快速查表 (Map)
+        self.locations_map = {}
+        self.objects_map = {}
+        self.agent_positions: Dict[str, str] = {} # {agent_name: location_id}
+
+        # 解析 JSON 結構
+        for loc in self.config["locations"]:
+            self.locations_map[loc["id"]] = loc
+            
+            # 處理地點內的物品
+            if "objects" in loc:
+                for obj in loc["objects"]:
+                    obj["parent_location"] = loc["id"]
+                    self.objects_map[obj["id"]] = obj
+
+    def get_location_description_for_llm(self) -> str:
+        """
+        生成給 LLM 看的地圖與物品清單
+        """
+        descriptions = []
+        for loc in self.config["locations"]:
+            # 描述地點
+            desc = f"- ID: {loc['id']} ({loc['name']}) | 功能: {', '.join(loc.get('affordances', []))}"
+            
+            # 描述該地點的物品
+            objs = []
+            if "objects" in loc:
+                for obj in loc["objects"]:
+                    objs.append(f"[{obj['id']}] {obj['name']}")
+            
+            if objs:
+                desc += f" | 物品: {', '.join(objs)}"
+            
+            descriptions.append(desc)
+            
+        return "\n".join(descriptions)
+
+    def get_observations(self, agent_name: str) -> List[str]:
+        """
+        生成 Agent 的觀察 (包含地點描述、物品狀態、其他 Agent)
+        """
+        current_loc_id = self.agent_positions.get(agent_name)
+        
+        # 異常狀態處理
+        if not current_loc_id or current_loc_id not in self.locations_map:
+            return ["你目前不在任何已知地點。"]
+        
+        loc_data = self.locations_map[current_loc_id]
+        obs = [f"你現在位於 {loc_data['name']} ({loc_data['description']})。"]
+        
+        # 1. 觀察物品狀態
+        if "objects" in loc_data:
+            for obj in loc_data["objects"]:
+                obs.append(f"這裡有一個 [{obj['id']}] {obj['name']}，狀態是: {obj['state']}。")
+        
+        # 2. 觀察其他人
         present_agents = []
         for name, position in self.agent_positions.items():
             if position == current_loc_id and name != agent_name:
@@ -75,13 +81,18 @@ class World:
             
         return obs
 
-    def update_object_state(self, object_id: str, new_state: str) -> str:
-        # ... (保持不變) ...
-        for loc in self.locations.values():
-            if object_id in loc.objects:
-                obj = loc.objects[object_id]
-                old_state = obj.state
-                obj.state = new_state
-                print(f"🌍 [世界事件] {obj.name} 的狀態從 '{old_state}' 變成了 '{new_state}'。")
-                return f"你成功將 {obj.name} 變為 {new_state}。"
-        return "找不到物件。"
+    def move_agent(self, agent_name: str, location_id: str):
+        """更新 Agent 位置"""
+        if location_id in self.locations_map:
+            self.agent_positions[agent_name] = location_id
+            return True
+        return False
+
+    def update_object_state(self, object_id: str, new_state: str):
+        """更新物品狀態"""
+        if object_id in self.objects_map:
+            obj = self.objects_map[object_id]
+            print(f"🌍 [物件更新] {obj['name']} ({object_id}): {obj['state']} -> {new_state}")
+            obj["state"] = new_state
+            return True
+        return False

@@ -19,5 +19,11 @@ graph.py
         is_routine = all("你現在位於" in o or "這裡有一個" in o or "You are" in o or "There is" in o for o in state["observations"])
         conti 的判定太草率
 
+        沒有加入 reflection
+
 ## new idea
 身分 prompt 要能隨著 reflection 改變
+從 plan 驅動改為 LLM 隨時決定
+說話時要有裡外思考
+
+問題是記憶

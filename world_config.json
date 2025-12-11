@@ -1,0 +1,37 @@
+{
+  "locations": [
+    {
+      "id": "bedroom",
+      "name": "臥室",
+      "description": "Klaus 的私人房間，安靜且舒適。",
+      "affordances": ["睡覺", "更衣", "發呆", "整理"],
+      "keywords": ["宿舍", "房間", "寢室", "睡覺的地方"], 
+      "objects": [
+        { "id": "bed", "name": "床", "state": "鋪好的" },
+        { "id": "desk", "name": "書桌", "state": "雜亂" }
+      ]
+    },
+    {
+      "id": "kitchen",
+      "name": "廚房",
+      "description": "宿舍的共用廚房區域。",
+      "affordances": ["做飯", "洗碗", "吃早餐", "喝咖啡"],
+      "keywords": ["餐廳", "飯廳", "煮飯的地方"],
+      "objects": [
+        { "id": "coffee_machine", "name": "咖啡機", "state": "閒置" },
+        { "id": "fridge", "name": "冰箱", "state": "滿的" }
+      ]
+    },
+    {
+      "id": "library",
+      "name": "圖書館",
+      "description": "大學圖書館，充滿書籍。",
+      "affordances": ["研究", "找資料", "寫論文", "閱讀"],
+      "keywords": ["書房", "自習室", "K館"],
+      "objects": [
+        { "id": "bookshelf", "name": "書架", "state": "整齊" },
+        { "id": "study_table", "name": "閱讀桌", "state": "空閒" }
+      ]
+    }
+  ]
+}

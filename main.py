@@ -3,145 +3,156 @@ import sys
 import os
 from datetime import datetime, timedelta
 
-# 修正路徑
+# 確保 Python 能找到 src 模組
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from src.agent.graph import GenerativeAgent
 from src.world.environment import World
 
 async def main():
+    # 清除螢幕
     os.system('cls' if os.name == 'nt' else 'clear')
     print("========================================")
-    print("🌍 小鎮模擬：多代理人版 (Multi-Agent)")
+    print("🌍 生成式代理：單人模擬模式 (Final Fixed)")
     print("========================================")
     
-    world = World()
-    
-    # --- 1. 初始化 Agents ---
-    print("🤖 正在初始化居民...")
-    
-    # 定義 Agent 清單
-    agents_config = [
-        {
-            "name": "Klaus",
-            "summary": "Klaus 是社會系學生。他喜歡整潔，正在寫論文，常去圖書館。",
-            "collection": "agent_klaus_multi_v1",
-            "start_loc": "Bedroom"
-        },
-        {
-            "name": "Maria",
-            "summary": "Maria 是一個熱愛物理的學生。她喜歡喝咖啡，經常在圖書館唸書，個性開朗。",
-            "collection": "agent_maria_multi_v1",
-            "start_loc": "Library" # Maria 一開始在圖書館
-        }
-    ]
-    
-    agents = []
-    # 用字典來儲存每個 Agent 的執行狀態 (Plan, Busy, etc.)
-    agent_states_memory = {} 
+    # 1. 初始化世界
+    print("Example: 正在讀取 world_config.json...")
+    try:
+        world = World("world_config.json")
+    except FileNotFoundError:
+        print("❌ 錯誤：找不到 world_config.json，請確保它在專案根目錄。")
+        return
 
-    for cfg in agents_config:
-        print(f"   ➕ 建立 {cfg['name']}...")
-        agent = GenerativeAgent(
-            name=cfg["name"],
-            summary=cfg["summary"],
-            collection_name=cfg["collection"]
-        )
-        agents.append(agent)
-        
-        # 設定初始位置
-        world.move_agent(cfg["name"], cfg["start_loc"])
-        
-        # 初始化記憶體狀態
-        agent_states_memory[cfg["name"]] = {
-            "daily_plan": [],
-            "short_term_plan": [],
-            "busy_until": None
-        }
-
+    # 2. 初始化 Klaus
+    agent_name = "Klaus"
+    print(f"🤖 正在喚醒 {agent_name}...")
+    
+    klaus = GenerativeAgent(
+        name=agent_name,
+        summary="Klaus 是成大學生，住在宿舍。生活規律，喜歡整潔，目前正致力於撰寫畢業論文。他喜歡在圖書館唸書，累了會喝咖啡。",
+        collection_name="text_sim_fixed_v1" # 改個名字確保記憶乾淨
+    )
+    
+    # 3. 設定初始狀態
     current_time = datetime.strptime("2025-06-01 08:00", "%Y-%m-%d %H:%M")
     
-    print(f"\n✅ 模擬開始！Klaus 在臥室，Maria 在圖書館。")
+    # 初始位置
+    start_location = "bedroom"
+    world.move_agent(agent_name, start_location)
     
-    # --- 2. 主迴圈 ---
-    while True:
-        print(f"\n⏰ {current_time.strftime('%I:%M %p')}")
-        print("-" * 50)
-        
-        # 每個 Agent 輪流行動
-        for agent in agents:
-            name = agent.name
-            
-            # 取得當前位置
-            loc_id = world.agent_positions[name]
-            loc_name = world.locations[loc_id].name
-            print(f"\n👤 {name} (位於: {loc_name})")
-            
-            # A. 感知 (從 World 拿，現在包含「看到其他人」)
-            observations = world.get_observations(name)
-            print(f"   👀 觀察: {observations}")
+    # [關鍵修正] 狀態變數初始化
+    agent_state = {
+        "daily_plan": [],
+        "short_term_plan": [],
+        "busy_until": None,
+        "last_location": start_location,
+        "current_daily_block_activity": None # 用於紀錄當前正在執行的大任務名稱
+    }
 
-            # B. 讀取上一輪的狀態
-            mem = agent_states_memory[name]
+    print(f"\n✅ 模擬開始！(按 Ctrl+C 結束)")
+    print("="*60)
+
+    try:
+        while True:
+            # --- A. 顯示環境資訊 ---
+            loc_id = agent_state["last_location"]
+            loc_name = world.locations_map[loc_id]["name"]
+            print(f"\n⏰ {current_time.strftime('%I:%M %p')} | 📍 {loc_name}")
+            print("-" * 30)
             
-            # C. 組裝 State
-            input_state = {
-                "agent_name": name,
-                "agent_summary": agent.summary,
+            # --- B. 感知 (Perceive) ---
+            observations = world.get_observations(agent_name)
+            map_desc = world.get_location_description_for_llm()
+            
+            # --- C. 思考 (Think - Async) ---
+            input_data = {
+                "agent_name": klaus.name,
+                "agent_summary": klaus.summary,
                 "current_time": current_time.strftime("%Y-%m-%d %I:%M %p"),
                 "observations": observations,
-                "daily_plan": mem["daily_plan"],
-                "short_term_plan": mem["short_term_plan"],
-                "busy_until": mem["busy_until"],
+                "world_map_desc": map_desc,
+                # 傳入上一輪的狀態
+                "daily_plan": agent_state["daily_plan"],
+                "short_term_plan": agent_state["short_term_plan"],
+                "busy_until": agent_state["busy_until"],
+                "current_daily_block_activity": agent_state["current_daily_block_activity"],
                 "relevant_memories": []
             }
             
-            # D. 思考 (Async)
-            # print(f"   🧠 思考中...")
-            result = await agent.graph.ainvoke(input_state)
+            # 執行 Graph
+            result = await klaus.graph.ainvoke(input_data)
             
-            # E. 更新狀態記憶
-            mem["daily_plan"] = result.get("daily_plan", [])
-            mem["short_term_plan"] = result.get("short_term_plan", [])
-            mem["busy_until"] = result.get("busy_until") # 這裡會拿到 "skip_thinking" 時的 None 或 原值
+            # --- D. 更新狀態 (Update State) ---
+            # [關鍵修正] 必須將所有狀態存回，包含 current_daily_block_activity
+            agent_state.update({
+                "daily_plan": result.get("daily_plan", []),
+                "short_term_plan": result.get("short_term_plan", []),
+                "busy_until": result.get("busy_until"),
+                "current_daily_block_activity": result.get("current_daily_block_activity")
+            })
             
-            # 處理顯示
+            # --- E. 執行動作與物理互動 (Act) ---
             if result.get("skip_thinking"):
-                print(f"   ⏳ (繼續執行上一個動作...)")
-                action = "BUSY" # 標記為忙碌，不觸發規則引擎
+                print(f"   ⏳ ({agent_name} 正在忙碌...)")
             else:
-                action = result.get("current_action", "發呆")
-                emoji = result.get("current_emoji", "😐")
-                print(f"   🎬 決定: {emoji} {action}")
-            
-            # F. 規則引擎 (處理移動與互動)
-            if action != "BUSY":
-                action_lower = action.lower()
+                action = result.get("current_action", "")
+                emoji = result.get("current_emoji", "")
+                target_loc_id = result.get("target_location_id")
+                target_obj_id = result.get("target_object_id")
                 
-                # 移動邏輯 (更新 World 的位置表)
-                target_loc = None
-                if "廚房" in action or "kitchen" in action_lower: target_loc = "Kitchen"
-                elif "圖書館" in action or "library" in action_lower: target_loc = "Library"
-                elif "臥室" in action or "bedroom" in action_lower: target_loc = "Bedroom"
-                elif "講堂" in action or "lecture" in action_lower: target_loc = "Lecture Hall"
+                print(f"   🎬 {emoji} {action}")
                 
-                if target_loc:
-                    world.move_agent(name, target_loc)
-                    print(f"   🚶 移動到了 {world.locations[target_loc].name}")
+                # --- [防呆補救機制] ---
+                # 如果 LLM 忘了給 ID，嘗試從 Action 文字反推
+                if not target_loc_id and ("前往" in action or "去" in action):
+                    for lid, data in world.locations_map.items():
+                        if data['name'] in action:
+                            target_loc_id = lid
+                            print(f"   🔧 補救導航: {lid}")
+                            break
+                
+                if not target_obj_id and not target_loc_id:
+                    # 嘗試補救物品操作
+                    current_loc_data = world.locations_map.get(agent_state["last_location"])
+                    if current_loc_data and "objects" in current_loc_data:
+                        for obj in current_loc_data["objects"]:
+                            if obj['name'] in action:
+                                target_obj_id = obj['id']
+                                print(f"   🔧 補救操作: {target_obj_id}")
+                                break
 
-                # 物件互動邏輯 (簡化版)
-                if "整理" in action and loc_id == "Bedroom":
-                    world.update_object_state("desk", "整潔")
-                elif "咖啡" in action and loc_id == "Kitchen":
-                    world.update_object_state("coffee_machine", "沖泡中")
-        
-        # 時間流逝
-        await asyncio.sleep(1) 
-        current_time += timedelta(minutes=15)
-        # input("Press Enter...") # Debug 用
+                # 1. 移動邏輯 (Location ID)
+                if target_loc_id and target_loc_id in world.locations_map:
+                    if target_loc_id != agent_state["last_location"]:
+                        target_name = world.locations_map[target_loc_id]["name"]
+                        print(f"   🚶 移動前往: {target_name} ({target_loc_id})")
+                        world.move_agent(agent_name, target_loc_id)
+                        agent_state["last_location"] = target_loc_id
+                        
+                # 2. 物品互動邏輯 (Object ID)
+                elif target_obj_id:
+                    # 需從 world.objects_map 查找名稱
+                    if target_obj_id in world.objects_map:
+                        obj_name = world.objects_map[target_obj_id]["name"]
+                        print(f"   👉 操作物品: {obj_name} ({target_obj_id})")
+                        
+                        # 簡單狀態更新規則
+                        if "咖啡" in action or "coffee" in action:
+                            world.update_object_state(target_obj_id, "運作中")
+                        elif "睡" in action or "sleep" in action:
+                            world.update_object_state(target_obj_id, "使用中")
+                        elif "整理" in action or "tidy" in action:
+                            world.update_object_state(target_obj_id, "整潔")
+                        elif "吃" in action or "eat" in action:
+                            world.update_object_state(target_obj_id, "空了")
+
+            # --- F. 時間流逝 ---
+            await asyncio.sleep(2) 
+            current_time += timedelta(minutes=15)
+
+    except KeyboardInterrupt:
+        print("\n👋 模擬結束")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 模擬結束。")
+    asyncio.run(main())

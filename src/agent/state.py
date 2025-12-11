@@ -25,3 +25,7 @@ class AgentState(TypedDict):
     # --- 輸出 ---
     current_action: Optional[str]
     current_emoji: Optional[str]
+
+    current_daily_block_activity: Optional[str]
+
+    
